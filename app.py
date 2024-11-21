@@ -1,62 +1,41 @@
-from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
-import os
 import PyPDF2
+import os
 
-# Initialize Flask app
-app = Flask(__name__)
-
-# Define upload folder and allowed file types
-UPLOAD_FOLDER = './uploads'
-ALLOWED_EXTENSIONS = {'pdf'}
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-# Ensure the upload folder exists
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-# Check allowed file extensions
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# Route to upload PDF
-@app.route('/upload', methods=['POST'])
-def upload_pdf():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        return jsonify({'message': f'File uploaded successfully: {filename}', 'file_path': filepath}), 200
-    else:
-        return jsonify({'error': 'Invalid file type'}), 400
-
-# Route to process PDF
-@app.route('/process_pdf', methods=['GET'])
-def process_pdf():
-    filename = request.args.get('filename')
-    if not filename:
-        return jsonify({'error': 'Filename is required'}), 400
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'File not found'}), 404
+def extract_pdf_text(pdf_path):
+    # Check if the file exists
+    if not os.path.exists(pdf_path):
+        print(f"Error: The file '{pdf_path}' does not exist.")
+        return None
 
     try:
-        with open(filepath, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
+        # Open the PDF file
+        with open(pdf_path, 'rb') as pdf_file:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
             text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text()
-            return jsonify({'message': 'PDF processed successfully', 'content': text}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            # Loop through all the pages and extract text
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text += page.extract_text() + "\n"
 
-# Run the Flask app
+            return text
+
+    except Exception as e:
+        print(f"Error processing the PDF: {str(e)}")
+        return None
+
+def main():
+    # Specify the location of your PDF file
+    pdf_path = 'path_to_your_pdf_file.pdf'
+
+    # Extract text from PDF
+    extracted_text = extract_pdf_text(pdf_path)
+
+    # If text is extracted, print it
+    if extracted_text:
+        print("Extracted Text from PDF:")
+        print(extracted_text)
+    else:
+        print("No text could be extracted.")
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    main()
