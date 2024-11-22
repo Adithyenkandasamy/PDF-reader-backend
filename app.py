@@ -3,6 +3,10 @@ import pdfplumber
 import os
 import openai
 import logging
+import fitz  # PyMuPDF
+import base64
+from PIL import Image
+from io import BytesIO
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 
@@ -24,6 +28,59 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'images'), exist_ok=True)
+
+def extract_images_from_pdf(pdf_path):
+    """Extract images from PDF using PyMuPDF."""
+    images = []
+    try:
+        # Open the PDF
+        pdf_document = fitz.open(pdf_path)
+        
+        # Iterate through pages
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            
+            # Get images from page
+            image_list = page.get_images()
+            
+            # Process each image
+            for img_index, img in enumerate(image_list):
+                try:
+                    # Get image data
+                    xref = img[0]
+                    base_image = pdf_document.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    
+                    # Convert to PIL Image
+                    image = Image.open(BytesIO(image_bytes))
+                    
+                    # Save image
+                    image_filename = f'page_{page_num + 1}_image_{img_index + 1}.png'
+                    image_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images', image_filename)
+                    image.save(image_path)
+                    
+                    # Convert image to base64 for model input
+                    buffered = BytesIO()
+                    image.save(buffered, format="PNG")
+                    img_base64 = base64.b64encode(buffered.getvalue()).decode()
+                    
+                    images.append({
+                        'filename': image_filename,
+                        'page': page_num + 1,
+                        'base64': img_base64
+                    })
+                    
+                    logger.debug(f"Extracted image {img_index + 1} from page {page_num + 1}")
+                except Exception as e:
+                    logger.error(f"Error processing image {img_index + 1} on page {page_num + 1}: {str(e)}")
+                    continue
+        
+        pdf_document.close()
+        return images
+    except Exception as e:
+        logger.error(f"Error extracting images from PDF: {str(e)}")
+        return []
 
 def extract_pdf_text(pdf_path):
     """Extract text from PDF file using pdfplumber."""
@@ -87,21 +144,66 @@ def extract_pdf_text(pdf_path):
         logger.error(f"Error processing the PDF: {str(e)}")
         return None
 
-def get_answer_from_model(question, context):
-    """Get answer from GPT-4o model."""
+def get_answer_from_model(question, context, images=None):
+    """Get answer from GPT-4o model with image support."""
     try:
         logger.debug("Making request to GPT-4o model")
         logger.debug(f"Context length: {len(context)} characters")
-        logger.debug(f"First 500 characters of context: {context[:500]}")
+        logger.debug(f"Number of images: {len(images) if images else 0}")
+        
+        # Prepare context with both text and image descriptions
+        full_context = context
+        if images:
+            full_context += "\n\nThe document also contains the following images:\n"
+            for idx, img in enumerate(images, 1):
+                full_context += f"\nImage {idx} (on page {img['page']}):\n"
+                # Get image description from model
+                try:
+                    image_messages = [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that describes images accurately and concisely."
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{img['base64']}"
+                                    }
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Describe this image briefly and include any visible text."
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    image_response = openai.ChatCompletion.create(
+                        model=MODEL_NAME,
+                        messages=image_messages,
+                        max_tokens=150
+                    )
+                    
+                    if image_response and image_response.choices:
+                        img_description = image_response.choices[0].message.content
+                        full_context += f"{img_description}\n"
+                except Exception as e:
+                    logger.error(f"Error getting image description: {str(e)}")
+                    continue
+        
+        logger.debug(f"First 500 characters of full context: {full_context[:500]}")
         
         messages = [
             {
                 "role": "system",
-                "content": "You are a helpful assistant that answers questions based on the provided context. Only answer based on the information given in the context."
+                "content": "You are a helpful assistant that answers questions based on the provided context, including both text and images. Only answer based on the information given in the context."
             },
             {
                 "role": "user",
-                "content": f"Context: {context}\n\nQuestion: {question}\n\nAnswer the question based only on the provided context."
+                "content": f"Context: {full_context}\n\nQuestion: {question}\n\nAnswer the question based only on the provided context."
             }
         ]
         
@@ -149,17 +251,26 @@ def upload_file():
         
         # Extract text from PDF
         text = extract_pdf_text(filepath)
-        if not text:
-            return jsonify({'error': 'Could not extract text from PDF'}), 400
         
-        # Store the text with the filename
-        app.pdf_texts = getattr(app, 'pdf_texts', {})
-        app.pdf_texts[filename] = text
+        # Extract images from PDF
+        images = extract_images_from_pdf(filepath)
+        logger.debug(f"Extracted {len(images)} images from PDF")
+        
+        if not text and not images:
+            return jsonify({'error': 'Could not extract any content from PDF'}), 400
+        
+        # Store the content with the filename
+        app.pdf_contents = getattr(app, 'pdf_contents', {})
+        app.pdf_contents[filename] = {
+            'text': text or '',
+            'images': images
+        }
         
         return jsonify({
             'message': 'File uploaded successfully',
             'filename': filename,
-            'text_length': len(text)
+            'text_length': len(text) if text else 0,
+            'image_count': len(images)
         }), 200
         
     except Exception as e:
@@ -179,24 +290,28 @@ def ask_question():
     filename = data['filename']
     question = data['question']
     
-    # Check if we have the text for this file
-    if not hasattr(app, 'pdf_texts') or filename not in app.pdf_texts:
+    # Check if we have the content for this file
+    if not hasattr(app, 'pdf_contents') or filename not in app.pdf_contents:
         return jsonify({'error': 'File not found or not processed'}), 404
     
     try:
-        # Get the text and get answer from model
-        text = app.pdf_texts[filename]
+        # Get the content
+        content = app.pdf_contents[filename]
+        text = content['text']
+        images = content['images']
+        
         logger.debug(f"Processing question for file: {filename}")
         logger.debug(f"Question: {question}")
         logger.debug(f"Text length: {len(text)} characters")
-        logger.debug(f"First 500 characters of text: {text[:500]}")
+        logger.debug(f"Number of images: {len(images)}")
         
-        answer = get_answer_from_model(question, text)
+        answer = get_answer_from_model(question, text, images)
         
         if answer:
             return jsonify({
                 'answer': answer,
-                'text_length': len(text)
+                'text_length': len(text),
+                'image_count': len(images)
             }), 200
         else:
             return jsonify({
