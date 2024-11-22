@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import PyPDF2
+import pdfplumber
 import os
 import openai
 import logging
@@ -26,17 +26,63 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 def extract_pdf_text(pdf_path):
-    """Extract text from PDF file."""
+    """Extract text from PDF file using pdfplumber."""
     if not os.path.exists(pdf_path):
+        logger.error(f"PDF file not found: {pdf_path}")
         return None
 
     try:
-        with open(pdf_path, 'rb') as pdf_file:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            return text
+        with pdfplumber.open(pdf_path) as pdf:
+            logger.debug(f"PDF has {len(pdf.pages)} pages")
+            
+            # Extract text from each page
+            text = []
+            for i, page in enumerate(pdf.pages):
+                try:
+                    # Extract text from the page
+                    page_text = page.extract_text()
+                    if page_text:
+                        text.append(page_text)
+                        logger.debug(f"Page {i + 1} text length: {len(page_text)}")
+                        logger.debug(f"Page {i + 1} first 200 chars: {page_text[:200]}")
+                    else:
+                        logger.warning(f"No text extracted from page {i + 1}")
+                        
+                        # Try extracting words directly
+                        words = page.extract_words()
+                        if words:
+                            page_text = ' '.join(word['text'] for word in words)
+                            text.append(page_text)
+                            logger.debug(f"Extracted {len(words)} words from page {i + 1}")
+                        else:
+                            logger.warning(f"No words found on page {i + 1}")
+                            
+                            # Try extracting tables
+                            tables = page.extract_tables()
+                            if tables:
+                                table_text = []
+                                for table in tables:
+                                    table_text.extend(' '.join(str(cell) for cell in row if cell) for row in table)
+                                if table_text:
+                                    text.append('\n'.join(table_text))
+                                    logger.debug(f"Extracted {len(tables)} tables from page {i + 1}")
+                            else:
+                                logger.warning(f"No tables found on page {i + 1}")
+                except Exception as e:
+                    logger.error(f"Error extracting text from page {i + 1}: {str(e)}")
+                    continue
+            
+            # Combine all text
+            final_text = '\n'.join(text)
+            
+            if final_text.strip():
+                logger.debug(f"Total extracted text length: {len(final_text)}")
+                logger.debug(f"First 500 characters: {final_text[:500]}")
+                return final_text
+            else:
+                logger.error("No text could be extracted from the PDF")
+                return None
+            
     except Exception as e:
         logger.error(f"Error processing the PDF: {str(e)}")
         return None
@@ -45,6 +91,8 @@ def get_answer_from_model(question, context):
     """Get answer from GPT-4o model."""
     try:
         logger.debug("Making request to GPT-4o model")
+        logger.debug(f"Context length: {len(context)} characters")
+        logger.debug(f"First 500 characters of context: {context[:500]}")
         
         messages = [
             {
@@ -57,7 +105,7 @@ def get_answer_from_model(question, context):
             }
         ]
         
-        logger.debug(f"Sending request with messages: {messages}")
+        logger.debug("Sending request to model")
         
         response = openai.ChatCompletion.create(
             model=MODEL_NAME,
@@ -69,7 +117,9 @@ def get_answer_from_model(question, context):
         logger.debug(f"Response: {response}")
         
         if response and response.choices:
-            return response.choices[0].message.content
+            answer = response.choices[0].message.content
+            logger.debug(f"Generated answer: {answer}")
+            return answer
         else:
             logger.error("No valid response from model")
             return None
@@ -95,6 +145,8 @@ def upload_file():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         
+        logger.debug(f"Processing PDF file: {filepath}")
+        
         # Extract text from PDF
         text = extract_pdf_text(filepath)
         if not text:
@@ -106,7 +158,8 @@ def upload_file():
         
         return jsonify({
             'message': 'File uploaded successfully',
-            'filename': filename
+            'filename': filename,
+            'text_length': len(text)
         }), 200
         
     except Exception as e:
@@ -136,12 +189,14 @@ def ask_question():
         logger.debug(f"Processing question for file: {filename}")
         logger.debug(f"Question: {question}")
         logger.debug(f"Text length: {len(text)} characters")
+        logger.debug(f"First 500 characters of text: {text[:500]}")
         
         answer = get_answer_from_model(question, text)
         
         if answer:
             return jsonify({
-                'answer': answer
+                'answer': answer,
+                'text_length': len(text)
             }), 200
         else:
             return jsonify({
